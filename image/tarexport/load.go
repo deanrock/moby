@@ -2,6 +2,8 @@ package tarexport
 
 import (
 	"archive/tar"
+	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -13,7 +15,6 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
-	"strings"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/distribution"
@@ -29,6 +30,7 @@ import (
 	"github.com/docker/docker/pkg/symlink"
 	"github.com/docker/docker/pkg/system"
 	"github.com/opencontainers/go-digest"
+	"github.com/pborman/uuid"
 )
 
 func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool) error {
@@ -47,27 +49,24 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 	}
 	defer os.RemoveAll(tmpDir)
 
-	/*b, err := inTar.Peek(1)
+	// use buffered reader to peek first 4 bytes to determine if it's
+	// a tar or squashfs file
+	reader := bufferedReadCloser{bufio.NewReader(inTar), inTar}
+
+	b, err := reader.Peek(4)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf(fmt.Sprintf("%d %v", b, b))*/
+	// squashfs magic
+	if bytes.Compare(b, []byte{0x68, 0x73, 0x71, 0x73}) == 0 {
+		return l.loadSquashFS(reader, tmpDir, outStream, progressOutput)
+	}
 
-	if err := chrootarchive.Untar(inTar, tmpDir, nil); err != nil {
+	if err := chrootarchive.Untar(reader, tmpDir, nil); err != nil {
 		return err
 	}
-	// check if tar contains only a single file, with name ending in .sqfs
-	dirInfo, err := ioutil.ReadDir(tmpDir)
-	if err != nil {
-		return err
-	}
-	if len(dirInfo) == 1 {
-		name := dirInfo[0].Name()
-		if strings.HasSuffix(name, ".sqfs") {
-			return l.loadSquashFS(tmpDir, name, outStream, progressOutput)
-		}
-	}
+
 	// read manifest, if no file then load in legacy mode
 	manifestPath, err := safePath(tmpDir, manifestFileName)
 	if err != nil {
@@ -187,8 +186,33 @@ func (l *tarexporter) hashOfFile(path string) ([]byte, error) {
 	return h.Sum(nil), nil
 }
 
-func (l *tarexporter) loadSquashFS(tmpDir string, fileName string, outStream io.Writer, progressOutput progress.Output) error {
-	h, err := l.hashOfFile(path.Join(tmpDir, fileName))
+func (l *tarexporter) loadSquashFS(inTar io.ReadCloser, tmpDir string, outStream io.Writer, progressOutput progress.Output) error {
+	// get storage root directory
+	root := ""
+	status := l.ls.Driver().Status()
+	for _, val := range status {
+		if val[0] == "Root Dir" {
+			root = val[1]
+		}
+	}
+	if root == "" {
+		return errors.New("cannot get root dir from graph driver")
+	}
+
+	// pipe input to destination file (will be renamed later on)
+	tmpDestination := path.Join(root, "squashfs", fmt.Sprintf("import-%s", uuid.New()))
+	handle, err := os.Create(tmpDestination)
+	if err != nil {
+		return err
+	}
+	defer handle.Close()
+
+	if _, err := io.Copy(handle, inTar); err != nil {
+		return err
+	}
+
+	// get hash of the file
+	h, err := l.hashOfFile(tmpDestination)
 	if err != nil {
 		return err
 	}
@@ -227,6 +251,7 @@ func (l *tarexporter) loadSquashFS(tmpDir string, fileName string, outStream io.
 		return err
 	}
 
+	// create layer
 	var rootFS image.RootFS
 	rootFS.Type = "layers"
 	rootFS.DiffIDs = make([]layer.DiffID, 1)
@@ -250,43 +275,18 @@ func (l *tarexporter) loadSquashFS(tmpDir string, fileName string, outStream io.
 	outStream.Write([]byte(fmt.Sprintf("layer:%s\n", newLayer)))
 
 	// move squashfs image
-	root := ""
-	status := l.ls.Driver().Status()
-	for _, val := range status {
-		if val[0] == "Root Dir" {
-			root = val[1]
-		}
-	}
-	if root == "" {
-		return errors.New("cannot get root dir from graph driver")
-	}
-
 	cacheID, err := l.ls.Store().GetCacheID(layer.ChainID(diffID))
 	if err != nil {
 		return err
 	}
 
+	// rename file to '<root>/squashfs/layerID'
 	destination := path.Join(root, "squashfs", cacheID)
 	outStream.Write([]byte(fmt.Sprintf("destination:%s\n", destination)))
-
-	// copy squashfs file (replace with reading from io.ReadCloser TODO)
-	s, err := os.Open(path.Join(tmpDir, fileName))
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-
-	d, err := os.Create(destination)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(d, s); err != nil {
-		d.Close()
-		return err
-	}
-	d.Close()
+	os.Rename(tmpDestination, destination)
 
 	defer layer.ReleaseAndLog(l.ls, newLayer)
+
 	if expected, actual := diffID, newLayer.DiffID(); expected != actual {
 		return fmt.Errorf("invalid diffID for layer: expected %q, got %q", expected, actual)
 	}
