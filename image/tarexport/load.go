@@ -172,18 +172,18 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 	return nil
 }
 
-func (l *tarexporter) hashOfFile(path string) ([]byte, error) {
+func (l *tarexporter) hashOfFile(path string) (string, error) {
 	handle, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
 	h := sha256.New()
 	if _, err := io.Copy(h, handle); err != nil {
-		return nil, err
+		return "", err
 	}
 
-	return h.Sum(nil), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func (l *tarexporter) loadSquashFS(inTar io.ReadCloser, tmpDir string, outStream io.Writer, progressOutput progress.Output) error {
@@ -199,7 +199,7 @@ func (l *tarexporter) loadSquashFS(inTar io.ReadCloser, tmpDir string, outStream
 		return errors.New("cannot get root dir from graph driver")
 	}
 
-	// pipe input to destination file (will be renamed later on)
+	// pipe input to destination file (will be renamed later on) and to sha256 hasher
 	tmpDestination := path.Join(root, "squashfs", fmt.Sprintf("import-%s", uuid.New()))
 	handle, err := os.Create(tmpDestination)
 	if err != nil {
@@ -207,16 +207,11 @@ func (l *tarexporter) loadSquashFS(inTar io.ReadCloser, tmpDir string, outStream
 	}
 	defer handle.Close()
 
-	if _, err := io.Copy(handle, inTar); err != nil {
+	h := sha256.New()
+	if _, err := io.Copy(h, io.TeeReader(inTar, handle)); err != nil {
 		return err
 	}
-
-	// get hash of the file
-	h, err := l.hashOfFile(tmpDestination)
-	if err != nil {
-		return err
-	}
-	hash := hex.EncodeToString(h)
+	hash := hex.EncodeToString(h.Sum(nil))
 
 	// create 'fake' tar archive
 	layerPath := path.Join(tmpDir, "content.tar")
@@ -256,11 +251,11 @@ func (l *tarexporter) loadSquashFS(inTar io.ReadCloser, tmpDir string, outStream
 	rootFS.Type = "layers"
 	rootFS.DiffIDs = make([]layer.DiffID, 1)
 
-	h, err = l.hashOfFile(layerPath)
+	hash, err = l.hashOfFile(layerPath)
 	if err != nil {
 		return err
 	}
-	diffID := layer.DiffID(fmt.Sprintf("sha256:%s", hex.EncodeToString(h)))
+	diffID := layer.DiffID(fmt.Sprintf("sha256:%s", hash))
 	outStream.Write([]byte(fmt.Sprintf("diffID:%s\n", diffID)))
 	r := rootFS
 	r.Append(diffID)
@@ -274,13 +269,13 @@ func (l *tarexporter) loadSquashFS(inTar io.ReadCloser, tmpDir string, outStream
 	}
 	outStream.Write([]byte(fmt.Sprintf("layer:%s\n", newLayer)))
 
-	// move squashfs image
+	// get cacheID of the layer
 	cacheID, err := l.ls.Store().GetCacheID(layer.ChainID(diffID))
 	if err != nil {
 		return err
 	}
 
-	// rename file to '<root>/squashfs/layerID'
+	// rename file to '<root>/squashfs/cacheID'
 	destination := path.Join(root, "squashfs", cacheID)
 	outStream.Write([]byte(fmt.Sprintf("destination:%s\n", destination)))
 	os.Rename(tmpDestination, destination)
