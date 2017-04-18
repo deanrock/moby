@@ -15,6 +15,7 @@ import (
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/distribution"
+	"github.com/docker/docker/daemon/graphdriver"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/opencontainers/go-digest"
 )
@@ -192,6 +193,8 @@ type Store interface {
 	Cleanup() error
 	DriverStatus() [][2]string
 	DriverName() string
+	Driver() graphdriver.Driver
+	Store() MetadataStore
 }
 
 // DescribableStore represents a layer store capable of storing

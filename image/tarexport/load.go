@@ -1,13 +1,19 @@
 package tarexport
 
 import (
+	"archive/tar"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/distribution"
@@ -41,8 +47,26 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 	}
 	defer os.RemoveAll(tmpDir)
 
+	/*b, err := inTar.Peek(1)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf(fmt.Sprintf("%d %v", b, b))*/
+
 	if err := chrootarchive.Untar(inTar, tmpDir, nil); err != nil {
 		return err
+	}
+	// check if tar contains only a single file, with name ending in .sqfs
+	dirInfo, err := ioutil.ReadDir(tmpDir)
+	if err != nil {
+		return err
+	}
+	if len(dirInfo) == 1 {
+		name := dirInfo[0].Name()
+		if strings.HasSuffix(name, ".sqfs") {
+			return l.loadSquashFS(tmpDir, name, outStream, progressOutput)
+		}
 	}
 	// read manifest, if no file then load in legacy mode
 	manifestPath, err := safePath(tmpDir, manifestFileName)
@@ -145,6 +169,143 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 	if imageRefCount == 0 {
 		outStream.Write([]byte(imageIDsStr))
 	}
+
+	return nil
+}
+
+func (l *tarexporter) hashOfFile(path string) ([]byte, error) {
+	handle, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+
+	h := sha256.New()
+	if _, err := io.Copy(h, handle); err != nil {
+		return nil, err
+	}
+
+	return h.Sum(nil), nil
+}
+
+func (l *tarexporter) loadSquashFS(tmpDir string, fileName string, outStream io.Writer, progressOutput progress.Output) error {
+	h, err := l.hashOfFile(path.Join(tmpDir, fileName))
+	if err != nil {
+		return err
+	}
+	hash := hex.EncodeToString(h)
+
+	// create 'fake' tar archive
+	layerPath := path.Join(tmpDir, "content.tar")
+	f, err := os.Create(layerPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	tw := tar.NewWriter(f)
+
+	var files = []struct {
+		Name, Body string
+	}{
+		{"SQUASHFS", hash},
+	}
+	for _, file := range files {
+		hdr := &tar.Header{
+			Name: file.Name,
+			Mode: 0600,
+			Size: int64(len(file.Body)),
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if _, err := tw.Write([]byte(file.Body)); err != nil {
+			return err
+		}
+	}
+
+	if err := tw.Close(); err != nil {
+		return err
+	}
+
+	var rootFS image.RootFS
+	rootFS.Type = "layers"
+	rootFS.DiffIDs = make([]layer.DiffID, 1)
+
+	h, err = l.hashOfFile(layerPath)
+	if err != nil {
+		return err
+	}
+	diffID := layer.DiffID(fmt.Sprintf("sha256:%s", hex.EncodeToString(h)))
+	outStream.Write([]byte(fmt.Sprintf("diffID:%s\n", diffID)))
+	r := rootFS
+	r.Append(diffID)
+	newLayer, err := l.ls.Get(r.ChainID())
+	outStream.Write([]byte(fmt.Sprintf("chainID:%s\n", r.ChainID())))
+	if err != nil {
+		newLayer, err = l.loadLayer(layerPath, rootFS, diffID.String(), distribution.Descriptor{}, progressOutput)
+		if err != nil {
+			return err
+		}
+	}
+	outStream.Write([]byte(fmt.Sprintf("layer:%s\n", newLayer)))
+
+	// move squashfs image
+	root := ""
+	status := l.ls.Driver().Status()
+	for _, val := range status {
+		if val[0] == "Root Dir" {
+			root = val[1]
+		}
+	}
+	if root == "" {
+		return errors.New("cannot get root dir from graph driver")
+	}
+
+	cacheID, err := l.ls.Store().GetCacheID(layer.ChainID(diffID))
+	if err != nil {
+		return err
+	}
+
+	destination := path.Join(root, "squashfs", cacheID)
+	outStream.Write([]byte(fmt.Sprintf("destination:%s\n", destination)))
+
+	// copy squashfs file (replace with reading from io.ReadCloser TODO)
+	s, err := os.Open(path.Join(tmpDir, fileName))
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	d, err := os.Create(destination)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(d, s); err != nil {
+		d.Close()
+		return err
+	}
+	d.Close()
+
+	defer layer.ReleaseAndLog(l.ls, newLayer)
+	if expected, actual := diffID, newLayer.DiffID(); expected != actual {
+		return fmt.Errorf("invalid diffID for layer: expected %q, got %q", expected, actual)
+	}
+	rootFS.Append(diffID)
+
+	img := image.Image{}
+	img.RootFS = &rootFS
+
+	config, err := json.Marshal(img)
+	if err != nil {
+		return err
+	}
+
+	imgID, err := l.is.Create(config)
+	if err != nil {
+		return err
+	}
+	imageIDsStr := fmt.Sprintf("Loaded image ID: %s\n", imgID)
+	outStream.Write([]byte(imageIDsStr))
 
 	return nil
 }

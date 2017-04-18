@@ -712,6 +712,14 @@ func (ls *layerStore) DriverName() string {
 	return ls.driver.String()
 }
 
+func (ls *layerStore) Driver() graphdriver.Driver {
+	return ls.driver
+}
+
+func (ls *layerStore) Store() MetadataStore {
+	return ls.store
+}
+
 type naiveDiffPathDriver struct {
 	graphdriver.Driver
 }

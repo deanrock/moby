@@ -106,6 +106,7 @@ func Init(root string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		"mnt",
 		"diff",
 		"layers",
+		"squashfs",
 	}
 
 	a := &Driver{
@@ -566,6 +567,26 @@ func (a *Driver) aufsMount(ro []string, rw, target, mountLabel string) (err erro
 			Unmount(target)
 		}
 	}()
+
+	// Mount squashfs layers
+	for _, layer := range ro {
+		s := strings.Split(layer, "/")
+		name := s[len(s)-1]
+		source := path.Join(a.rootPath(), "squashfs", name)
+		if _, err := os.Stat(source); err == nil {
+			out, err := exec.Command("mount").Output()
+			if err != nil {
+				return err
+			}
+
+			if !strings.Contains(string(out), layer) {
+				out, err = exec.Command("mount", "-t", "squashfs", source, layer).Output()
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
 
 	// Mount options are clipped to page size(4096 bytes). If there are more
 	// layers then these are remounted individually using append.
