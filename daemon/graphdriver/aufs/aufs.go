@@ -572,20 +572,7 @@ func (a *Driver) aufsMount(ro []string, rw, target, mountLabel string) (err erro
 	for _, layer := range ro {
 		s := strings.Split(layer, "/")
 		name := s[len(s)-1]
-		source := path.Join(a.rootPath(), "squashfs", name)
-		if _, err := os.Stat(source); err == nil {
-			out, err := exec.Command("mount").Output()
-			if err != nil {
-				return err
-			}
-
-			if !strings.Contains(string(out), layer) {
-				out, err = exec.Command("mount", "-t", "squashfs", source, layer).Output()
-				if err != nil {
-					return err
-				}
-			}
-		}
+		a.squashfsMount(name)
 	}
 
 	// Mount options are clipped to page size(4096 bytes). If there are more

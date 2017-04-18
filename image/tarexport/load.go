@@ -58,7 +58,8 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 		return err
 	}
 
-	// squashfs magic
+	// squashfs magic (be advised this check is error prone because tar header starts
+        // with a filename)
 	if bytes.Compare(b, []byte{0x68, 0x73, 0x71, 0x73}) == 0 {
 		return l.loadSquashFS(reader, tmpDir, outStream, progressOutput)
 	}
