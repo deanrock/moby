@@ -205,7 +205,14 @@ func (l *tarexporter) loadSquashFS(inTar io.ReadCloser, tmpDir string, outStream
 	if err != nil {
 		return err
 	}
-	defer handle.Close()
+	defer func() {
+		handle.Close()
+
+		// remove file if exists by tmp filename
+		if _, err := os.Stat(tmpDestination); err == nil {
+			os.Remove(tmpDestination)
+		}
+	}()
 
 	h := sha256.New()
 	if _, err := io.Copy(h, io.TeeReader(inTar, handle)); err != nil {
